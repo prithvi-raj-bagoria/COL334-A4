@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
+
 """
 Part 1 Server: Reliable UDP File Transfer with Sliding Window Protocol
-Implements: Sequence numbers, ACKs, Timeouts, Fast Retransmit
+Implements: Sequence numbers, ACKs, Timeouts, Selective Repeat
+FIXED: Track ACKs by sequence number, NOT chunk index!
 """
 
 import socket
@@ -32,32 +34,29 @@ class ReliableUDPServer:
         self.dev_rtt = 0
         self.timeout = TIMEOUT
         
-        # Window management
-        self.base = 0  # First unacknowledged byte
+        # Window management - SR
+        self.send_base = 0  # First unacknowledged byte
         self.next_seq = 0  # Next sequence number to send
         self.packets = {}  # seq_num -> (data, send_time)
-        self.dup_ack_count = {}  # Track duplicate ACKs
+        self.individually_acked = set()  # Track individually acked SEQ NUMBERS!
         
-        print(f"[SERVER] Started on {host}:{port} with SWS={sws} bytes")
-    
+        #print(f"[SERVER] Started on {host}:{port} with SWS={sws} bytes")
+
     def create_packet(self, seq_num, data):
         """Create a packet with sequence number and data"""
-        # First 4 bytes: sequence number
-        # Next 16 bytes: reserved (zeros)
-        # Remaining: data
         header = struct.pack('!I', seq_num) + b'\x00' * 16
         return header + data
-    
-    def parse_ack(self, packet):
-        """Parse ACK packet to get the acknowledged sequence number"""
+
+    def parse_sr_ack(self, packet):
+        """Parse SR ACK packet to get the INDIVIDUAL sequence number"""
         if len(packet) >= 4:
-            ack_num = struct.unpack('!I', packet[:4])[0]
-            return ack_num
+            ack_seq = struct.unpack('!I', packet[:4])[0]
+            return ack_seq
         return None
-    
+
     def update_rtt(self, sample_rtt):
         """Update RTT estimates using TCP-like algorithm"""
-        if self.estimated_rtt == TIMEOUT:  # First measurement
+        if self.estimated_rtt == TIMEOUT:
             self.estimated_rtt = sample_rtt
             self.dev_rtt = sample_rtt / 2
         else:
@@ -65,129 +64,143 @@ class ReliableUDPServer:
             self.estimated_rtt = (1 - ALPHA) * self.estimated_rtt + ALPHA * sample_rtt
         
         self.timeout = max(self.estimated_rtt + 4 * self.dev_rtt, 0.1)
-    
+
     def send_file(self, client_addr, filename):
-        """Send file to client using reliable UDP with sliding window"""
+        """Send file to client using Selective Repeat protocol"""
         try:
             with open(filename, 'rb') as f:
                 file_data = f.read()
         except FileNotFoundError:
-            print(f"[SERVER] Error: {filename} not found")
+            #print(f"[SERVER] Error: {filename} not found")
             return
-        
-        print(f"[SERVER] Sending file {filename} ({len(file_data)} bytes) to {client_addr}")
+
+        #print(f"[SERVER] Sending file {filename} ({len(file_data)} bytes) to {client_addr}")
         
         # Split file into chunks
         chunks = []
-        for i in range(0, len(file_data), DATA_SIZE):
-            chunks.append(file_data[i:i+DATA_SIZE])
+        seq_numbers = []  # Track sequence numbers for each chunk!
         
+        current_seq = 0
+        for i in range(0, len(file_data), DATA_SIZE):
+            chunk = file_data[i:i+DATA_SIZE]
+            chunks.append(chunk)
+            seq_numbers.append(current_seq)
+            current_seq += len(chunk)
+
         total_packets = len(chunks)
-        self.base = 0
+        #print(f"[SERVER] Total chunks: {total_packets}")
+        
+        self.send_base = 0
         self.next_seq = 0
         self.packets = {}
-        self.dup_ack_count = {}
-        last_ack = -1
+        self.individually_acked = set()
         
         start_time = time.time()
-        
-        while self.base < len(file_data):
+
+        # SR keeps sending until all packets individually acked
+        while len(self.individually_acked) < total_packets:
             # Send packets within window
-            while self.next_seq < len(file_data) and (self.next_seq - self.base) < self.sws:
+            while self.next_seq < len(file_data) and (self.next_seq - self.send_base) < self.sws:
                 chunk_idx = self.next_seq // DATA_SIZE
                 if chunk_idx < len(chunks):
-                    packet = self.create_packet(self.next_seq, chunks[chunk_idx])
-                    self.socket.sendto(packet, client_addr)
-                    self.packets[self.next_seq] = (packet, time.time())
+                    # FIX: Check if THIS SEQUENCE NUMBER is acked, not chunk index!
+                    if self.next_seq not in self.individually_acked:
+                        packet = self.create_packet(self.next_seq, chunks[chunk_idx])
+                        self.socket.sendto(packet, client_addr)
+                        self.packets[self.next_seq] = (packet, time.time())
+                    
                     self.next_seq += len(chunks[chunk_idx])
-            
+
             # Wait for ACKs with timeout
             ready = select.select([self.socket], [], [], self.timeout)
-            
+
             if ready[0]:
                 # Receive ACK
                 try:
                     ack_packet, _ = self.socket.recvfrom(PACKET_SIZE)
-                    ack_num = self.parse_ack(ack_packet)
-                    
-                    if ack_num is not None:
-                        # Calculate RTT for packets being acknowledged
-                        if ack_num > self.base and self.base in self.packets:
-                            _, send_time = self.packets[self.base]
-                            sample_rtt = time.time() - send_time
-                            self.update_rtt(sample_rtt)
-                        
-                        if ack_num > self.base:
-                            # New ACK - slide window
-                            self.base = ack_num
-                            last_ack = ack_num
-                            self.dup_ack_count = {}  # Reset duplicate ACK counter
+                    ack_seq = self.parse_sr_ack(ack_packet)
+
+                    if ack_seq is not None:
+                        # FIX: Track by SEQUENCE NUMBER, not chunk index!
+                        if ack_seq not in self.individually_acked:
+                            # First time seeing this ACK
+                            if ack_seq in self.packets:
+                                _, send_time = self.packets[ack_seq]
+                                sample_rtt = time.time() - send_time
+                                self.update_rtt(sample_rtt)
                             
-                            # Remove acknowledged packets
-                            to_remove = [seq for seq in self.packets if seq < self.base]
-                            for seq in to_remove:
-                                del self.packets[seq]
+                            self.individually_acked.add(ack_seq)
+                            #print(f"[SERVER] ✓ ACK seq={ack_seq} received ({len(self.individually_acked)}/{total_packets})")
                         
-                        elif ack_num == last_ack and ack_num == self.base:
-                            # Duplicate ACK
-                            self.dup_ack_count[ack_num] = self.dup_ack_count.get(ack_num, 0) + 1
+                        # SR slides window only when base packet is acked
+                        while self.send_base in self.individually_acked:
+                            chunk_idx = self.send_base // DATA_SIZE
+                            if chunk_idx < len(chunks):
+                                advance_by = len(chunks[chunk_idx])
+                            else:
+                                advance_by = DATA_SIZE
                             
-                            # Fast retransmit after 3 duplicate ACKs
-                            if self.dup_ack_count[ack_num] == 3:
-                                print(f"[SERVER] Fast retransmit at seq {self.base}")
-                                if self.base in self.packets:
-                                    packet, _ = self.packets[self.base]
-                                    self.socket.sendto(packet, client_addr)
-                                    self.packets[self.base] = (packet, time.time())
-                
+                            if self.send_base in self.packets:
+                                del self.packets[self.send_base]
+                            
+                            self.send_base += advance_by
+
                 except Exception as e:
-                    print(f"[SERVER] Error receiving ACK: {e}")
-            
+                    pass
+                    #print(f"[SERVER] Error receiving ACK: {e}")
+
             else:
-                # Timeout - retransmit base packet
-                if self.base in self.packets:
-                    print(f"[SERVER] Timeout, retransmitting seq {self.base}")
-                    packet, _ = self.packets[self.base]
-                    self.socket.sendto(packet, client_addr)
-                    self.packets[self.base] = (packet, time.time())
-                    self.timeout = min(self.timeout * 2, 2.0)  # Exponential backoff
-        
-        # Send EOF marker
+                # SR retransmit - send ALL unacked packets in window
+                #print(f"[SERVER] Timeout! Retransmitting...")
+                for seq_num in sorted(self.packets.keys()):
+                    if (seq_num >= self.send_base and 
+                        seq_num < self.send_base + self.sws and
+                        seq_num not in self.individually_acked):
+                        
+                        packet, _ = self.packets[seq_num]
+                        self.socket.sendto(packet, client_addr)
+                        self.packets[seq_num] = (packet, time.time())
+                
+                # Exponential backoff
+                self.timeout = min(self.timeout * 2, 2.0)
+
+        # NOW ALL packets are acked, send EOF
+        #print("[SERVER] ✓ All packets acked! Sending EOF...")
         eof_packet = self.create_packet(self.next_seq, EOF_MARKER)
-        for _ in range(5):  # Send EOF multiple times for reliability
+        for i in range(10):
             self.socket.sendto(eof_packet, client_addr)
             time.sleep(0.05)
-        
+
         elapsed = time.time() - start_time
-        print(f"[SERVER] File transfer complete in {elapsed:.2f}s")
-    
+        print(f"[SERVER] ✓✓✓ Transfer complete in {elapsed:.2f}s ✓✓✓")
+
     def run(self):
         """Main server loop"""
-        print("[SERVER] Waiting for client request...")
+        #print("[SERVER] Waiting for client request...")
         
-        # Wait for initial client request (with retry support)
         while True:
             try:
                 data, client_addr = self.socket.recvfrom(PACKET_SIZE)
-                if data:  # Any data means file request
-                    print(f"[SERVER] Received request from {client_addr}")
+                if data:
+                    #print(f"[SERVER] Received request from {client_addr}")
                     self.send_file(client_addr, "data.txt")
                     break
             except Exception as e:
-                print(f"[SERVER] Error: {e}")
-        
+                pass
+                #print(f"[SERVER] Error: {e}")
+
         self.socket.close()
-        print("[SERVER] Server terminated")
+        #print("[SERVER] Server terminated")
 
 def main():
     if len(sys.argv) != 4:
-        print("Usage: python3 p1_server.py <SERVER_IP> <SERVER_PORT> <SWS>")
+        #print("Usage: python3 p1_server.py <SERVER_IP> <SERVER_PORT> <SWS>")
         sys.exit(1)
-    
+
     host = sys.argv[1]
     port = int(sys.argv[2])
     sws = int(sys.argv[3])
-    
+
     server = ReliableUDPServer(host, port, sws)
     server.run()
 
