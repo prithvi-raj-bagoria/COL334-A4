@@ -23,7 +23,7 @@ class CustomTopo(Topo):
         self.addLink(h1, s1, loss=loss, delay=f'{delay}ms', jitter=f'{jitter}ms')
 
         # Link between h2 and s1 with no packet loss (client side)
-        self.addLink(h2, s1, loss=0)
+        self.addLink(h2, s1, loss=0, delay='0ms', jitter='0ms')
 
 
 def compute_md5(file_path):
@@ -56,8 +56,8 @@ def run(expname):
     SERVER_IP = "10.0.0.1"
     SERVER_PORT = 6555
     SWS = 5 * 1180
-            
-    NUM_ITERATIONS = 5 
+        
+    NUM_ITERATIONS = 1
     OUTFILE = 'received_data.txt'
     delay_list, loss_list, jitter_list = [], [], []
 
@@ -75,12 +75,17 @@ def run(expname):
         return
 
     print("Loss list:", loss_list, "Delay list:", delay_list, "Jitter list:", jitter_list)
+    print("\n" + "="*80)
     
     for LOSS in loss_list:
         for DELAY in delay_list:
             for JITTER in jitter_list:
+                print(f"\n{'='*80}")
+                print(f"TEST: Loss={LOSS}%, Delay={DELAY}ms, Jitter={JITTER}ms")
+                print(f"{'='*80}")
+                
                 for i in range(0, NUM_ITERATIONS):
-                    print(f"\n--- Running topology with {LOSS}% packet loss, base delay {DELAY}ms and jitter {JITTER}ms (iter {i+1}/{NUM_ITERATIONS})")
+                    print(f"\n--- Iteration {i+1}/{NUM_ITERATIONS} ---")
 
                     # Create the custom topology with the specified loss, delay and jitter
                     topo = CustomTopo(loss=LOSS, delay=DELAY, jitter=JITTER)
@@ -106,8 +111,15 @@ def run(expname):
                     ttc = end_time - start_time
 
                     md5_hash = compute_md5(OUTFILE)
+                    
+                    # Print time immediately for visibility
+                    print(f">>> Transfer completed in {ttc:.2f} seconds")
+                    if md5_hash:
+                        print(f">>> MD5: {md5_hash}")
+                    
                     # write the result to a file
                     f_out.write(f"{i},{LOSS},{DELAY},{JITTER},{md5_hash},{ttc}\n")
+                    f_out.flush()  # Flush to ensure data is written immediately
 
                     # Stop the network
                     net.stop()
@@ -116,12 +128,14 @@ def run(expname):
                     time.sleep(1)
 
     f_out.close()
-    print("\n--- Completed all tests ---")
+    print("\n" + "="*80)
+    print("--- Completed all tests ---")
+    print("="*80)
 
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print("Usage: python experiment.py <expname>")
+        print("Usage: python p1_exp.py <expname>")
     else:
         expname = sys.argv[1].lower()
         run(expname)
