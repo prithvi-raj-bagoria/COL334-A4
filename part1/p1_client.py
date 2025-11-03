@@ -93,7 +93,7 @@ class ReliableUDPClient:
 
         # Receive remaining packets
         consecutive_timeouts = 0
-        max_consecutive_timeouts = 10  # Increased from 5
+        max_consecutive_timeouts = 50  # Increased from 5
         eof_received = False  # FIXED: Track EOF properly
         last_packet_time = time.time()
 
@@ -142,21 +142,22 @@ class ReliableUDPClient:
                     #print(f"[CLIENT] Total packets received: {len(self.received_packets)}")
 
             except socket.timeout:
-                consecutive_timeouts += 1
-                elapsed_since_packet = time.time() - last_packet_time
+                pass
+                # consecutive_timeouts += 1
+                # elapsed_since_packet = time.time() - last_packet_time
                 
-                #print(f"[CLIENT] Timeout {consecutive_timeouts}/{max_consecutive_timeouts} (elapsed: {elapsed_since_packet:.1f}s, packets: {len(self.received_packets)})")
+                # #print(f"[CLIENT] Timeout {consecutive_timeouts}/{max_consecutive_timeouts} (elapsed: {elapsed_since_packet:.1f}s, packets: {len(self.received_packets)})")
 
-                # Check if we should give up
-                if consecutive_timeouts >= max_consecutive_timeouts:
-                    #print(f"[CLIENT] Max timeouts reached. Exiting receive loop.")
-                    #print(f"[CLIENT] Total packets received: {len(self.received_packets)}")
-                    # FIXED: Exit gracefully even without EOF
-                    break
+                # # Check if we should give up
+                # if consecutive_timeouts >= max_consecutive_timeouts:
+                #     #print(f"[CLIENT] Max timeouts reached. Exiting receive loop.")
+                #     #print(f"[CLIENT] Total packets received: {len(self.received_packets)}")
+                #     # FIXED: Exit gracefully even without EOF
+                #     break
 
-                if elapsed_since_packet > 30:
-                    #print(f"[CLIENT] No packets for {elapsed_since_packet:.1f}s. Exiting.")
-                    break
+                # # if elapsed_since_packet > 300:
+                # #     #print(f"[CLIENT] No packets for {elapsed_since_packet:.1f}s. Exiting.")
+                # #     break
 
             except Exception as e:
                 #print(f"[CLIENT] Error: {e}")

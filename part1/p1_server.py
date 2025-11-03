@@ -39,7 +39,8 @@ class ReliableUDPServer:
         self.next_seq = 0  # Next sequence number to send
         self.packets = {}  # seq_num -> (data, send_time)
         self.individually_acked = set()  # Track individually acked SEQ NUMBERS!
-        
+        self.first_send_time = {}  # seq_num -> first send time
+
         #print(f"[SERVER] Started on {host}:{port} with SWS={sws} bytes")
 
     def create_packet(self, seq_num, data):
@@ -107,7 +108,9 @@ class ReliableUDPServer:
                     if self.next_seq not in self.individually_acked:
                         packet = self.create_packet(self.next_seq, chunks[chunk_idx])
                         self.socket.sendto(packet, client_addr)
-                        self.packets[self.next_seq] = (packet, time.time())
+                        send_time = time.time()
+                        self.packets[self.next_seq] = (packet, send_time)
+                        self.first_send_time[self.next_seq] = send_time  # SAVE FIRST SEND TIME
                     
                     self.next_seq += len(chunks[chunk_idx])
 
@@ -124,10 +127,9 @@ class ReliableUDPServer:
                         # FIX: Track by SEQUENCE NUMBER, not chunk index!
                         if ack_seq not in self.individually_acked:
                             # First time seeing this ACK
-                            if ack_seq in self.packets:
-                                _, send_time = self.packets[ack_seq]
-                                sample_rtt = time.time() - send_time
-                                self.update_rtt(sample_rtt)
+                                if ack_seq in self.first_send_time:
+                                    sample_rtt = time.time() - self.first_send_time[ack_seq]
+                                    self.update_rtt(sample_rtt)
                             
                             self.individually_acked.add(ack_seq)
                             #print(f"[SERVER] ✓ ACK seq={ack_seq} received ({len(self.individually_acked)}/{total_packets})")
@@ -143,6 +145,10 @@ class ReliableUDPServer:
                             if self.send_base in self.packets:
                                 del self.packets[self.send_base]
                             
+                            # Also delete from first_send_time to prevent memory leak
+                            if self.send_base in self.first_send_time:
+                                del self.first_send_time[self.send_base]
+
                             self.send_base += advance_by
 
                 except Exception as e:
@@ -159,10 +165,10 @@ class ReliableUDPServer:
                         
                         packet, _ = self.packets[seq_num]
                         self.socket.sendto(packet, client_addr)
-                        self.packets[seq_num] = (packet, time.time())
+                        # DON'T update self.packets[seq_num] - keep original send time!
                 
                 # Exponential backoff
-                self.timeout = min(self.timeout * 2, 2.0)
+                self.timeout = min(self.timeout * 2, 1)
 
         # NOW ALL packets are acked, send EOF
         #print("[SERVER] ✓ All packets acked! Sending EOF...")
