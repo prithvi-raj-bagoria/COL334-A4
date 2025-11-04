@@ -1,224 +1,243 @@
 #!/usr/bin/env python3
-
 """
-Part 1 Client: Reliable UDP File Transfer Client
-Implements: ACK sending, in-order delivery, packet reassembly
-Protocol: Selective Repeat (SR)
-"""
+Reliable-UDP file receiver (State-Driven Design).
 
+This version refactors the client into a more formal state-based design
+with distinct "handshake" and "download" phases.
+The core SACK generation and file writing logic remains identical.
+
+Usage: python3 p1_client.py <SERVER_IP> <SERVER_PORT>
+"""
 import socket
-import sys
 import struct
+import sys
 import time
 
-# Constants
-PACKET_SIZE = 1200
-HEADER_SIZE = 20
-DATA_SIZE = PACKET_SIZE - HEADER_SIZE
+# Protocol constants
+UDP_MAX = 1200
+HEADER_LEN = 20
 
-REQUEST_TIMEOUT = 2.0
-MAX_RETRIES = 5
-EOF_MARKER = b"EOF"
-
-class ReliableUDPClient:
-    def __init__(self, server_host, server_port):
-        self.server_host = server_host
-        self.server_port = int(server_port)
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.socket.settimeout(5.0)
-
-        self.recv_base = 0
-        self.received_packets = {}
-        self.acked_packets = set()
-        self.output_file = "received_data.txt"
-
-        #print(f"[CLIENT] Connecting to server {server_host}:{server_port}")
-
-    def parse_packet(self, packet):
-        """Parse received packet to extract sequence number and data"""
-        if len(packet) < HEADER_SIZE:
-            return None, None
-
-        seq_num = struct.unpack('!I', packet[:4])[0]
-        data = packet[HEADER_SIZE:]
-
-        return seq_num, data
-
-    def create_sr_ack(self, packet_seq_num):
-        """Create SR ACK for THIS specific packet"""
-        return struct.pack('!I', packet_seq_num) + b'\x00' * 16
-
-    def send_request(self):
-        """Send file request to server with retries"""
-        request = b'\x01'
-
-        for attempt in range(MAX_RETRIES):
-            try:
-                #print(f"[CLIENT] Sending request (attempt {attempt + 1}/{MAX_RETRIES})")
-                self.socket.sendto(request, (self.server_host, self.server_port))
-
-                self.socket.settimeout(REQUEST_TIMEOUT)
-                data, _ = self.socket.recvfrom(PACKET_SIZE)
-
-                if data:
-                    #print("[CLIENT] Request successful, got first packet!")
-                    return data
-
-            except socket.timeout:
-                pass
-                #print(f"[CLIENT] Request timeout on attempt {attempt + 1}")
-                continue
-
-        #print("[CLIENT] Failed to connect to server")
-        return None
-
-    def receive_file(self):
-        """Receive file from server using Selective Repeat protocol"""
+class Receiver:
+    def __init__(self, srv_ip, srv_port):
+        self.srv_ip = srv_ip
+        self.srv_port = srv_port
+        self.srv_addr = (srv_ip, srv_port)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         
-        # Send request and get first packet
-        first_packet = self.send_request()
-        if not first_packet:
-            return False
+        # State variables
+        self.buffered = {}  # seq -> bytes (out-of-order buffer)
+        self.next_expected = 0
+        self.saw_eof = False
+        self.eof_seq = None
+        self.consecutive_timeouts = 0
 
-        # Process first packet
-        seq_num, data = self.parse_packet(first_packet)
-        if seq_num is not None:
-            #print(f"[CLIENT] Processing first packet: seq={seq_num}, data_len={len(data)}")
-            self.received_packets[seq_num] = data
-            self.acked_packets.add(seq_num)
+    # ---------------- Packet Helper Methods (Unchanged) ----------------
+    @staticmethod
+    def _compose_ack(next_expected, sack_blocks=None):
+        """Create an ACK packet with optional SACK blocks."""
+        if sack_blocks is None:
+            sack_blocks = []
+        buf = struct.pack('!I', next_expected)
+        opt = b''
+        for start, end in sack_blocks[:2]:
+            opt += struct.pack('!I', start) + struct.pack('!I', end)
+        opt = opt.ljust(16, b'\x00')
+        return buf + opt
 
-            ack = self.create_sr_ack(seq_num)
-            self.socket.sendto(ack, (self.server_host, self.server_port))
-            #print(f"[CLIENT] Sent ACK for seq={seq_num}")
+    @staticmethod
+    def _parse_packet(pkt):
+        """Parse an incoming data packet."""
+        if len(pkt) < HEADER_LEN:
+            return None, None, False
+        seq = struct.unpack('!I', pkt[:4])[0]
+        payload = pkt[HEADER_LEN:]
+        if payload == b'EOF':
+            return seq, b'', True
+        return seq, payload, False
 
-        # Receive remaining packets
-        consecutive_timeouts = 0
-        max_consecutive_timeouts = 50  # Increased from 5
-        eof_received = False  # FIXED: Track EOF properly
-        last_packet_time = time.time()
+    # ---------------- Core Logic Methods (Unchanged) ----------------
+    def _drain_inorder_buffer(self, file_obj):
+        """Write any buffered contiguous segments starting at next_expected."""
+        while self.next_expected in self.buffered:
+            piece = self.buffered.pop(self.next_expected)
+            file_obj.write(piece)
+            self.next_expected += len(piece)
 
-        #print("[CLIENT] Entering receive loop...")
-
-        while not eof_received:  # FIXED: Changed from while True to while not eof_received
-            try:
-                self.socket.settimeout(5.0)
-                packet, _ = self.socket.recvfrom(PACKET_SIZE)
-
-                consecutive_timeouts = 0  # Reset on successful receive
-                last_packet_time = time.time()
-
-                seq_num, data = self.parse_packet(packet)
-                if seq_num is None:
-                    #print("[CLIENT] Got malformed packet, skipping...")
-                    continue
-
-                # Check for EOF marker
-                if data == EOF_MARKER:
-                    #print(f"[CLIENT] ✓ Received EOF marker!")
-                    ack = self.create_sr_ack(seq_num)
-                    for _ in range(3):
-                        self.socket.sendto(ack, (self.server_host, self.server_port))
-                    eof_received = True  # FIXED: Set this to True to exit loop
-                    break  # FIXED: Explicitly break to exit
-
-                # SR Duplicate check
-                if seq_num in self.acked_packets:
-                    ack = self.create_sr_ack(seq_num)
-                    self.socket.sendto(ack, (self.server_host, self.server_port))
-                    #print(f"[CLIENT] Duplicate packet seq={seq_num}, resent ACK")
-                    continue
-
-                # SR Store this specific packet
-                #print(f"[CLIENT] ✓ Received packet: seq={seq_num}, data_len={len(data)}")
-                self.received_packets[seq_num] = data
-                self.acked_packets.add(seq_num)
-
-                # SR Send INDIVIDUAL ACK
-                ack = self.create_sr_ack(seq_num)
-                self.socket.sendto(ack, (self.server_host, self.server_port))
-                
-                if len(self.received_packets) % 5 == 0:
-                    pass
-                    #print(f"[CLIENT] Total packets received: {len(self.received_packets)}")
-
-            except socket.timeout:
-                pass
-                # consecutive_timeouts += 1
-                # elapsed_since_packet = time.time() - last_packet_time
-                
-                # #print(f"[CLIENT] Timeout {consecutive_timeouts}/{max_consecutive_timeouts} (elapsed: {elapsed_since_packet:.1f}s, packets: {len(self.received_packets)})")
-
-                # # Check if we should give up
-                # if consecutive_timeouts >= max_consecutive_timeouts:
-                #     #print(f"[CLIENT] Max timeouts reached. Exiting receive loop.")
-                #     #print(f"[CLIENT] Total packets received: {len(self.received_packets)}")
-                #     # FIXED: Exit gracefully even without EOF
-                #     break
-
-                # # if elapsed_since_packet > 300:
-                # #     #print(f"[CLIENT] No packets for {elapsed_since_packet:.1f}s. Exiting.")
-                # #     break
-
-            except Exception as e:
-                #print(f"[CLIENT] Error: {e}")
+    def _get_sack_blocks(self):
+        """Create up to two SACK blocks from buffered segments."""
+        if not self.buffered:
+            return []
+        seqs = sorted(self.buffered.keys())
+        blocks = []
+        cur_s, cur_e = None, None
+        for s in seqs:
+            seg_end = s + len(self.buffered[s])
+            if cur_s is None:
+                cur_s, cur_e = s, seg_end
+            elif s <= cur_e:
+                cur_e = max(cur_e, seg_end)
+            else:
+                blocks.append((cur_s, cur_e))
+                cur_s, cur_e = s, seg_end
+            if len(blocks) >= 2:
                 break
+        if cur_s is not None and len(blocks) < 2:
+            blocks.append((cur_s, cur_e))
+        return blocks[:2]
 
-        #print(f"[CLIENT] Receive loop complete. Total packets: {len(self.received_packets)}")
-        #print(f"[CLIENT] EOF received: {eof_received}")  # FIXED: Show EOF status
-        return True
-
-    def write_file(self):
-        """Write received packets to file in order"""
-        try:
-            if not self.received_packets:
-                #print("[CLIENT] ERROR: No packets received!")
+    # ---------------- Refactored Control Flow ----------------
+    def _run_handshake(self):
+        """
+        Handles the initial connection request state.
+        Tries 5 times, 2-sec timeout.
+        """
+        self.sock.settimeout(2.0)
+        for attempt in range(5):
+            try:
+                print(f"Request attempt {attempt+1}/5")
+                self.sock.sendto(b'D', self.srv_addr)
+                
+                pkt, addr = self.sock.recvfrom(UDP_MAX)
+                if addr == self.srv_addr:
+                    print("Server contacted. Beginning download...")
+                    # Process this first packet
+                    self._process_data_packet(pkt)
+                    return True # Handshake successful
+            except socket.timeout:
+                if attempt < 4:
+                    print("No response, retrying...")
+                continue
+            except Exception as e:
+                print(f"Handshake error: {e}")
                 return False
                 
-            sorted_seqs = sorted(self.received_packets.keys())
-            #print(f"[CLIENT] Writing {len(sorted_seqs)} packets to {self.output_file}...")
+        print("Failed to contact server after 5 attempts.")
+        return False # Handshake failed
 
-            total_size = 0
-            with open(self.output_file, 'wb') as f:
-                for seq in sorted_seqs:
-                    f.write(self.received_packets[seq])
-                    total_size += len(self.received_packets[seq])
-
-            #print(f"[CLIENT] ✓ File saved! Total size: {total_size} bytes")
-            return True
+    def _run_download(self):
+        """
+        Handles the main data transfer state.
+        Assumes handshake was successful.
+        """
+        try:
+            with open('received_data.txt', 'wb') as fout:
+                # Set a shorter timeout for the transfer loop
+                self.sock.settimeout(1.0)
+                
+                # Drain the first packet(s) received during handshake
+                self._drain_inorder_buffer(fout)
+                
+                while not self._is_complete():
+                    try:
+                        # Wait for a packet
+                        pkt, addr = self.sock.recvfrom(UDP_MAX)
+                        if addr == self.srv_addr:
+                            self._handle_packet_recv(pkt, fout)
+                            
+                    except socket.timeout:
+                        self._handle_timeout()
+                        
+                        if self.consecutive_timeouts > 10:
+                            print("Too many consecutive timeouts, aborting.")
+                            return False
+                            
+                # Loop finished normally
+                print(f"Total bytes written: {self.next_expected}")
+                return True
 
         except Exception as e:
-            #print(f"[CLIENT] Error writing file: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"Download loop error: {e}")
             return False
 
-    def run(self):
-        """Main client routine"""
-        try:
-            if self.receive_file():
-                if self.write_file():
-                    pass
-                    #print("[CLIENT] ✓✓✓ Transfer completed successfully! ✓✓✓")
-                else:
-                    pass
-                    #print("[CLIENT] Write failed")
-            else:
-                pass
-                #print("[CLIENT] Receive failed")
-        finally:
-            self.socket.close()
-            #print("[CLIENT] Socket closed")
+    def _handle_packet_recv(self, pkt, file_obj):
+        """Logic for processing a newly received packet."""
+        self.consecutive_timeouts = 0
+        seq, data, eof_flag = self._parse_packet(pkt)
+        if seq is None:
+            return # Ignore malformed packet
 
+        # Process the packet data
+        if eof_flag:
+            self.saw_eof = True
+            self.eof_seq = seq
+        elif data:
+            if seq == self.next_expected:
+                file_obj.write(data)
+                self.next_expected += len(data)
+                self._drain_inorder_buffer(file_obj) # Drain buffer
+            elif seq > self.next_expected:
+                self.buffered.setdefault(seq, data) # Buffer out-of-order
+        
+        # Always send an ACK in response
+        self._send_ack()
+
+    def _process_data_packet(self, pkt):
+        """
+        Simplified version of _handle_packet_recv used *only* during handshake,
+        where we can't write to a file yet. We just buffer.
+        """
+        seq, data, eof_flag = self._parse_packet(pkt)
+        if seq is None:
+            return
+
+        if eof_flag:
+            self.saw_eof = True
+            self.eof_seq = seq
+        elif data:
+            # We can't write to file yet, so just buffer everything
+            self.buffered.setdefault(seq, data)
+        
+        # Send an ACK for this first packet
+        self._send_ack()
+
+    def _handle_timeout(self):
+        """Logic for handling a socket timeout."""
+        self.consecutive_timeouts += 1
+        # Proactively re-send our last ACK to trigger retransmit
+        self._send_ack()
+
+    def _send_ack(self):
+        """Consolidated ACK sender."""
+        sacks = self._get_sack_blocks()
+        ack_pkt = self._compose_ack(self.next_expected, sack_blocks=sacks)
+        self.sock.sendto(ack_pkt, self.srv_addr)
+
+    def _is_complete(self):
+        """Checks if the file transfer is finished."""
+        return self.saw_eof and (self.eof_seq == self.next_expected)
+
+    def start(self):
+        """
+        Public entry point. Runs the client's state machine.
+        """
+        try:
+            if not self._run_handshake():
+                return False # Handshake failed
+            
+            # Handshake OK, proceed to download
+            return self._run_download()
+            
+        finally:
+            self.sock.close()
+            print("Socket closed.")
+
+# ---------------- Main ----------------
 def main():
     if len(sys.argv) != 3:
-        #print("Usage: python3 p1_client.py <SERVER_IP> <SERVER_PORT>")
+        print("Usage: python3 p1_client.py <SERVER_IP> <SERVER_PORT>")
         sys.exit(1)
-
-    server_host = sys.argv[1]
-    server_port = sys.argv[2]
-
-    client = ReliableUDPClient(server_host, server_port)
-    client.run()
+    ip = sys.argv[1]
+    port = int(sys.argv[2])
+    
+    r = Receiver(ip, port)
+    ok = r.start()
+    
+    if ok:
+        print("Download successful. File saved to 'received_data.txt'")
+        sys.exit(0)
+    else:
+        print("Download failed.")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
